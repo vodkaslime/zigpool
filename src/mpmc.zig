@@ -3,6 +3,8 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Mutex = std.Thread.Mutex;
 
+const int_utils = @import("./int_utils.zig");
+
 const err = @import("./err.zig");
 const QueueError = err.QueueError;
 
@@ -12,156 +14,134 @@ const QueueError = err.QueueError;
 // Actions of popItem() and getItem() move the pointers above
 // via CAS actions.
 //
+// Basic item type is u64, and a valid item value cannot be 0,
+// since 0 stands for empty.
+//
 // action_index guarantees the mpmc queue without ABA issue.
-pub fn Queue(comptime T: type) type {
+pub const Queue = struct {
+    const Self = @This();
 
-    const Node = struct {
-        data: ?T,
-        action_index: usize,
-    };
+    allocator: Allocator,
+    ring_buf: []u128,
+    head_index: usize,
+    tail_index: usize,
+    wait_time: u64,
 
-    return struct {
-        const Self = @This();
-
-        allocator: Allocator,
-        ring_buf: []*Node,
-        head_index: usize,
-        tail_index: usize,
-        wait_time: u64,
-
-        // Initializes the mpmc queue with capacity and wait_time.
-        pub fn init(allocator: Allocator, capacity: usize, wait_time: u64) !Self {
-            if (capacity == 0) {
-                return QueueError.invalid_capacity;
-            }
-
-            var ring_buf = try allocator.alloc(*Node, capacity);
-            for (ring_buf) |*item, index| {
-                var node = try allocator.create(Node);
-                node.* = Node {
-                    .data = null,
-                    .action_index = index,
-                };
-                item.* = node;
-            }
-
-            return Self {
-                .allocator = allocator,
-                .ring_buf = ring_buf,
-                .head_index = 0,
-                .tail_index = 0,
-                .wait_time = wait_time,
-            };
+    // Initializes the mpmc queue with capacity and wait_time.
+    pub fn init(allocator: Allocator, capacity: usize, wait_time: u64) !Self {
+        if (capacity == 0) {
+            return QueueError.invalid_capacity;
         }
 
-        // Deinit the mpmc queue. Free the contents in self.ring_buf.
-        pub fn deinit(self: *Self) void {
-            for (self.ring_buf) |item| {
-                self.allocator.destroy(item);
+        var ring_buf = try allocator.alloc(u128, capacity);
+        for (ring_buf) |_, index| {
+            ring_buf[index] = int_utils.assembleBigInteger(@intCast(u64, index), 0);
+        }
+
+        return Self {
+            .allocator = allocator,
+            .ring_buf = ring_buf,
+            .head_index = 0,
+            .tail_index = 0,
+            .wait_time = wait_time,
+        };
+    }
+
+    // Deinit the mpmc queue. Free self.ring_buf.
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.ring_buf);
+    }
+
+    // Wait self.wait_time for next run of action.
+    fn wait(self: *Self) void {
+        std.time.sleep(self.wait_time * std.time.ns_per_ms);
+    }
+
+    // Pop item from the queue.
+    // If the queue is not empty, return the item.
+    // It the queue is emptry, return QueueError.queue_empty.
+    pub fn popItem(self: *Self) !u64 {
+        const capacity = self.ring_buf.len;
+
+        while (true) {
+            const head_index = self.head_index;
+            const ptr = head_index % capacity;
+
+            const expected_val = self.ring_buf[ptr];
+            const action_index = int_utils.parseActionIndex(expected_val);
+            const value = int_utils.parseValue(expected_val);
+
+            // ABA issue happened.
+            if (action_index > @intCast(u64, head_index + capacity)) {
+                self.wait();
+                continue;
             }
-            self.allocator.free(self.ring_buf);
-        }
 
-        // Wait self.wait_time for next run of action.
-        fn wait(self: *Self) void {
-            std.time.sleep(self.wait_time * std.time.ns_per_ms);
-        }
-
-        // Pop item from the queue.
-        // If the queue is not empty, return the item.
-        // It the queue is emptry, return QueueError.queue_empty.
-        pub fn popItem(self: *Self) !T {
-            const capacity = self.ring_buf.len;
-
-            while (true) {
-                const head_index = self.head_index;
-                const ptr = head_index % capacity;
-
-                const expected_node = self.ring_buf[ptr];
-                
-                // ABA issue happened.
-                if (expected_node.action_index > head_index + capacity) {
-                    self.wait();
-                    continue;
-                }
-
-                // If the data is null, then the queue is empty.
-                // No need to move the pointer.
-                if (expected_node.data == null) {
-                    return QueueError.queue_empty;
-                }
-
-                var new_node = try self.allocator.create(Node);
-                new_node.* = Node {
-                    .data = null,
-                    .action_index = head_index + capacity,
-                };
-
-                const res_option = @cmpxchgStrong(*Node, &self.ring_buf[ptr], expected_node, new_node, .SeqCst, .SeqCst);
-                if (res_option == null) {
-                    _ = @atomicRmw(u64, &self.head_index, .Add, 1, .SeqCst);
-                    var res = expected_node.data.?;
-                    self.allocator.destroy(expected_node);
-                    return res;
-                } else {
-                    self.allocator.destroy(new_node);
-                    self.wait();
-                    continue;
-                }
+            // If the value is 0, then the queue is empty.
+            // No need to move the pointer.
+            if (value == 0) {
+                return QueueError.queue_empty;
             }
-        }
 
-        // Put item into the queue.
-        // If the queue is not full, put the item.
-        // It the queue is emptry, return QueueError.queue_full.
-        pub fn putItem(self: *Self, item: T) !void {
-            const capacity = self.ring_buf.len;
+            const new_val = int_utils.assembleBigInteger(@intCast(u64, head_index + capacity), 0);
 
-            while (true) {
-                const tail_index = self.tail_index;
-                const ptr = tail_index % capacity;
-
-                var expected_node = self.ring_buf[ptr];
-                
-                // ABA issue happened.
-                if (expected_node.action_index > tail_index) {
-                    self.wait();
-                    continue;
-                }
-
-                // If the data is not null, then the queue is full.
-                // No need to move the pointer.
-                if (expected_node.data != null) {
-                    return QueueError.queue_full;
-                }
-
-                var new_node = try self.allocator.create(Node);
-                new_node.* = Node {
-                    .data = item,
-                    .action_index = tail_index + capacity,
-                };
-
-                const res_option = @cmpxchgStrong(*Node, &self.ring_buf[ptr], expected_node, new_node, .SeqCst, .SeqCst);
-                if (res_option == null) {
-                    _ = @atomicRmw(u64, &self.tail_index, .Add, 1, .SeqCst);
-                    self.allocator.destroy(expected_node);
-                    return;
-                } else {
-                    self.allocator.destroy(new_node);
-                    self.wait();
-                    continue;
-                }
+            const res_option = @cmpxchgStrong(u128, &self.ring_buf[ptr], expected_val, new_val, .SeqCst, .SeqCst);
+            if (res_option == null) {
+                _ = @atomicRmw(u64, &self.head_index, .Add, 1, .SeqCst);
+                return value;
+            } else {
+                self.wait();
+                continue;
             }
         }
-    };
-}
+    }
+
+    // Put item into the queue.
+    // If the queue is not full, put the item.
+    // It the queue is emptry, return QueueError.queue_full.
+    pub fn putItem(self: *Self, item: u64) !void {
+        const capacity = self.ring_buf.len;
+
+        while (true) {
+            const tail_index = self.tail_index;
+            const ptr = tail_index % capacity;
+
+            const expected_val = self.ring_buf[ptr];
+            const action_index = int_utils.parseActionIndex(expected_val);
+            const value = int_utils.parseValue(expected_val);
+            
+            // ABA issue happened.
+            if (action_index > @intCast(u64, tail_index)) {
+                self.wait();
+                continue;
+            }
+
+            // If the value is not null, then the queue is full.
+            // No need to move the pointer.
+            if (value != 0) {
+                return QueueError.queue_full;
+            }
+
+            const new_val = int_utils.assembleBigInteger(@intCast(u64, tail_index + capacity), item);
+
+            const res_option = @cmpxchgStrong(u128, &self.ring_buf[ptr], expected_val, new_val, .SeqCst, .SeqCst);
+            if (res_option == null) {
+                _ = @atomicRmw(u64, &self.tail_index, .Add, 1, .SeqCst);
+                return;
+            } else {
+                self.wait();
+                continue;
+            }
+        }
+    }
+};
 
 test "queue_init_empty" {
-    try testing.expectError(QueueError.invalid_capacity, Queue(u8).init(testing.allocator, 0, 10));
+    try testing.expectError(QueueError.invalid_capacity, Queue.init(testing.allocator, 0, 10));
 }
 
 test "basic_test" {
-    var q = try Queue(u8).init(testing.allocator, 3, 10);
+    var q = try Queue.init(testing.allocator, 3, 10);
     defer q.deinit();
 
     try q.putItem(1);
@@ -189,7 +169,7 @@ test "basic_test" {
 }
 
 test "test_multiple_actions" {
-    var q = try Queue(u8).init(testing.allocator, 20, 10);
+    var q = try Queue.init(testing.allocator, 20, 10);
     defer q.deinit();
 
     var index: usize = 0;

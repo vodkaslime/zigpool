@@ -6,7 +6,8 @@ const Mutex = std.Thread.Mutex;
 const Stream = net.Stream;
 
 const err = @import("./err.zig");
-const mpmc = @import("./mpmc.zig");
+const mpmc_adapter = @import("./mpmc_adapter.zig");
+const Adapter = mpmc_adapter.Adapter;
 const ConnPoolError = err.ConnPoolError;
 const QueueError = err.QueueError;
 
@@ -27,11 +28,11 @@ pub const ConnPool = struct {
     allocator: Allocator,
     config: Config,
     mutex: Mutex,
-    queue: mpmc.Queue(*Stream),
+    queue: Adapter(Stream),
     conns_map: AutoHashMap(*Stream, ConnStatus),
 
     pub fn init(allocator: Allocator, config: Config) !Self {
-        var queue = try mpmc.Queue(*Stream).init(allocator, config.capacity, 10);
+        var queue = try Adapter(Stream).init(allocator, config.capacity, 10);
         var conns_map = AutoHashMap(*Stream, ConnStatus).init(allocator);
         return Self {
             .allocator = allocator,
