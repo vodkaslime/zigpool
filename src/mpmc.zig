@@ -59,7 +59,7 @@ pub const Queue = struct {
 
     // Pop item from the queue.
     // If the queue is not empty, return the item.
-    // It the queue is emptry, return QueueError.queue_empty.
+    // It the queue is empty, return QueueError.queue_empty.
     pub fn popItem(self: *Self) !u64 {
         const capacity = self.ring_buf.len;
 
@@ -98,7 +98,7 @@ pub const Queue = struct {
 
     // Put item into the queue.
     // If the queue is not full, put the item.
-    // It the queue is emptry, return QueueError.queue_full.
+    // It the queue is empty, return QueueError.queue_full.
     pub fn putItem(self: *Self, item: u64) !void {
         const capacity = self.ring_buf.len;
 

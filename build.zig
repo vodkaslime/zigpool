@@ -22,6 +22,8 @@ pub fn build(b: *std.build.Builder) void {
     inline for (.{
         "src/zigpool.zig",
         "src/mpmc.zig",
+        "src/mpmc_adapter.zig",
+        "src/int_utils.zig",
     }) |test_file| {
         const t = b.addTest(test_file);
         t.setBuildMode(mode);
