@@ -179,32 +179,40 @@ test "basic_test" {
     try testing.expectError(QueueError.queue_empty, q.popItem());
 }
 
-test "test_resize" {
-    var q = try Queue(u8).init(testing.allocator, 5, 10);
+test "test_multiple_actions" {
+    var q = try Queue(u8).init(testing.allocator, 20, 10);
     defer q.deinit();
 
-    try q.putItem(1);
+    var index: usize = 0;
+    while (index < 100000): (index += 1) {
+        try q.putItem(1);
 
-    try q.putItem(2);
+        try q.putItem(2);
 
-    try q.putItem(3);
+        try q.putItem(3);
 
-    try q.putItem(4);
+        try q.putItem(4);
 
-    try q.putItem(5);
+        try q.putItem(5);
 
-    const a1 = try q.popItem();
-    try testing.expectEqual(a1, 1);
+        try q.putItem(6);
 
-    const a2 = try q.popItem();
-    try testing.expectEqual(a2, 2);
+        const a1 = try q.popItem();
+        try testing.expectEqual(a1, 1);
 
-    const a3 = try q.popItem();
-    try testing.expectEqual(a3, 3);
+        const a2 = try q.popItem();
+        try testing.expectEqual(a2, 2);
 
-    const a4 = try q.popItem();
-    try testing.expectEqual(a4, 4);
+        const a3 = try q.popItem();
+        try testing.expectEqual(a3, 3);
 
-    const a5 = try q.popItem();
-    try testing.expectEqual(a5, 5);
+        const a4 = try q.popItem();
+        try testing.expectEqual(a4, 4);
+
+        const a5 = try q.popItem();
+        try testing.expectEqual(a5, 5);
+
+        const a6 = try q.popItem();
+        try testing.expectEqual(a6, 6);
+    }
 }
