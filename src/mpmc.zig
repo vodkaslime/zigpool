@@ -6,206 +6,205 @@ const Mutex = std.Thread.Mutex;
 const err = @import("./err.zig");
 const QueueError = err.QueueError;
 
-// This is a minimal mpmc queue design:
+// This is a lock_free mpmc queue design:
 //
-// Two locks each for producer side and consumer side,
-// so that the mpmc is reduced to spsc styled ring buffer.
-// Would consider using some lock_free/wait_free design in the future
-// to improve performance.
+// A ring buffer with two pointers: head_index and tail_index.
+// Actions of popItem() and getItem() move the pointers above
+// via CAS actions.
+//
+// action_index guarantees the mpmc queue without ABA issue.
 pub fn Queue(comptime T: type) type {
+
+    const Node = struct {
+        data: ?T,
+        action_index: usize,
+    };
+
     return struct {
         const Self = @This();
 
         allocator: Allocator,
-        ring_buf: []T,
-        producer_mutex: Mutex,
-        consumer_mutex: Mutex,
-        len: usize,
+        ring_buf: []*Node,
         head_index: usize,
         tail_index: usize,
+        wait_time: u64,
 
-        pub fn init(allocator: Allocator, capacity: usize) !Self {
+        pub fn init(allocator: Allocator, capacity: usize, wait_time: u64) !Self {
             if (capacity == 0) {
                 return QueueError.invalid_capacity;
             }
 
-            var ring_buf = try allocator.alloc(T, capacity);
+            var ring_buf = try allocator.alloc(*Node, capacity);
+            for (ring_buf) |*item, index| {
+                var node = try allocator.create(Node);
+                node.* = Node {
+                    .data = null,
+                    .action_index = index,
+                };
+                item.* = node;
+            }
+
             return Self {
                 .allocator = allocator,
                 .ring_buf = ring_buf,
-                .producer_mutex = .{},
-                .consumer_mutex = .{},
-                .len = 0,
                 .head_index = 0,
                 .tail_index = 0,
+                .wait_time = wait_time,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            for (self.ring_buf) |item| {
+                self.allocator.destroy(item);
+            }
             self.allocator.free(self.ring_buf);
         }
 
-        pub fn getItem(self: *Self) !T {
-            self.consumer_mutex.lock();
-            defer self.consumer_mutex.unlock();
-            
-            if (self.len == 0) {
-                return QueueError.queue_empty;
-            }
-
-            var res = self.ring_buf[self.head_index];
-
-            return res;
+        fn wait(self: *Self) void {
+            std.time.sleep(self.wait_time * std.time.ns_per_ms);
         }
 
         pub fn popItem(self: *Self) !T {
-            self.consumer_mutex.lock();
-            defer self.consumer_mutex.unlock();
-            
-            if (self.len == 0) {
-                return QueueError.queue_empty;
+            const capacity = self.ring_buf.len;
+
+            while (true) {
+                const head_index = self.head_index;
+                const ptr = head_index % capacity;
+
+                const expected_node = self.ring_buf[ptr];
+                
+                // ABA issue happened.
+                if (expected_node.action_index > head_index + capacity) {
+                    self.wait();
+                    continue;
+                }
+
+                // If the data is null, then the queue is empty.
+                // No need to move the pointer.
+                if (expected_node.data == null) {
+                    return QueueError.queue_empty;
+                }
+
+                var new_node = try self.allocator.create(Node);
+                new_node.* = Node {
+                    .data = null,
+                    .action_index = head_index + capacity,
+                };
+
+                const res_option = @cmpxchgStrong(*Node, &self.ring_buf[ptr], expected_node, new_node, .SeqCst, .SeqCst);
+                if (res_option == null) {
+                    _ = @atomicRmw(u64, &self.head_index, .Add, 1, .SeqCst);
+                    var res = expected_node.data.?;
+                    self.allocator.destroy(expected_node);
+                    return res;
+                } else {
+                    self.allocator.destroy(new_node);
+                    self.wait();
+                    continue;
+                }
             }
-
-            var res = self.ring_buf[self.head_index];
-
-            self.head_index = (self.head_index + 1) % self.ring_buf.len;
-            self.len -= 1;
-
-            return res;
         }
 
         pub fn putItem(self: *Self, item: T) !void {
-            self.producer_mutex.lock();
-            defer self.producer_mutex.unlock();
+            const capacity = self.ring_buf.len;
 
-            if (self.len == self.ring_buf.len) {
-                return QueueError.queue_full;
+            while (true) {
+                const tail_index = self.tail_index;
+                const ptr = tail_index % capacity;
+
+                var expected_node = self.ring_buf[ptr];
+                
+                // ABA issue happened.
+                if (expected_node.action_index > tail_index) {
+                    self.wait();
+                    continue;
+                }
+
+                // If the data is not null, then the queue is full.
+                // No need to move the pointer.
+                if (expected_node.data != null) {
+                    return QueueError.queue_full;
+                }
+
+                var new_node = try self.allocator.create(Node);
+                new_node.* = Node {
+                    .data = item,
+                    .action_index = tail_index + capacity,
+                };
+
+                const res_option = @cmpxchgStrong(*Node, &self.ring_buf[ptr], expected_node, new_node, .SeqCst, .SeqCst);
+                if (res_option == null) {
+                    _ = @atomicRmw(u64, &self.tail_index, .Add, 1, .SeqCst);
+                    self.allocator.destroy(expected_node);
+                    return;
+                } else {
+                    self.allocator.destroy(new_node);
+                    self.wait();
+                    continue;
+                }
             }
-
-            self.ring_buf[self.tail_index] = item;
-
-            self.tail_index = (self.tail_index + 1) % self.ring_buf.len;
-            self.len += 1;
-        }
-
-        pub fn resize(self: *Self, new_capacity: usize) !void {
-            if (new_capacity == 0) {
-                return QueueError.invalid_capacity;
-            }
-
-            if (new_capacity == self.ring_buf.len) {
-                return;
-            }
-
-            self.consumer_mutex.lock();
-            defer self.consumer_mutex.unlock();
-
-            self.producer_mutex.lock();
-            defer self.producer_mutex.unlock();
-
-            if (new_capacity < self.len) {
-                return QueueError.resize_too_small;
-            }
-
-            var new_buf = try self.allocator.alloc(T, new_capacity);
-            const old_buf = self.ring_buf;
-            var index: usize = 0;
-            while (index < self.len):(index += 1) {
-                new_buf[index] = old_buf[(self.head_index + index) % old_buf.len];
-            }
-
-            self.ring_buf = new_buf;
-            self.head_index = 0;
-            self.tail_index = self.len % new_capacity;
-            self.allocator.free(old_buf);
         }
     };
 }
 
 test "queue_init_empty" {
-    try testing.expectError(QueueError.invalid_capacity, Queue(u8).init(testing.allocator, 0));
+    try testing.expectError(QueueError.invalid_capacity, Queue(u8).init(testing.allocator, 0, 10));
 }
 
 test "basic_test" {
-    var q = try Queue(u8).init(testing.allocator, 3);
+    var q = try Queue(u8).init(testing.allocator, 3, 10);
     defer q.deinit();
-    try testing.expectEqual(q.len, 0);
 
     try q.putItem(1);
-    try testing.expectEqual(q.len, 1);
 
     try q.putItem(2);
-    try testing.expectEqual(q.len, 2);
 
     try q.putItem(3);
-    try testing.expectEqual(q.len, 3);
 
     try testing.expectError(QueueError.queue_full, q.putItem(4));
-    try testing.expectEqual(q.len, 3);
 
     try testing.expectError(QueueError.queue_full, q.putItem(5));
-    try testing.expectEqual(q.len, 3);
 
     const a1 = try q.popItem();
     try testing.expectEqual(a1, 1);
-    try testing.expectEqual(q.len, 2);
 
     const a2 = try q.popItem();
     try testing.expectEqual(a2, 2);
-    try testing.expectEqual(q.len, 1);
 
     const a3 = try q.popItem();
     try testing.expectEqual(a3, 3);
-    try testing.expectEqual(q.len, 0);
 
     try testing.expectError(QueueError.queue_empty, q.popItem());
-    try testing.expectEqual(q.len, 0);
 
     try testing.expectError(QueueError.queue_empty, q.popItem());
-    try testing.expectEqual(q.len, 0);
 }
 
 test "test_resize" {
-    var q = try Queue(u8).init(testing.allocator, 5);
+    var q = try Queue(u8).init(testing.allocator, 5, 10);
     defer q.deinit();
-    try testing.expectEqual(q.len, 0);
 
     try q.putItem(1);
-    try testing.expectEqual(q.len, 1);
 
     try q.putItem(2);
-    try testing.expectEqual(q.len, 2);
 
     try q.putItem(3);
-    try testing.expectEqual(q.len, 3);
 
     try q.putItem(4);
-    try testing.expectEqual(q.len, 4);
 
     try q.putItem(5);
-    try testing.expectEqual(q.len, 5);
-
-    try testing.expectError(QueueError.resize_too_small, q.resize(3));
 
     const a1 = try q.popItem();
     try testing.expectEqual(a1, 1);
-    try testing.expectEqual(q.len, 4);
 
     const a2 = try q.popItem();
     try testing.expectEqual(a2, 2);
-    try testing.expectEqual(q.len, 3);
 
     const a3 = try q.popItem();
     try testing.expectEqual(a3, 3);
-    try testing.expectEqual(q.len, 2);
-
-    try q.resize(10);
 
     const a4 = try q.popItem();
     try testing.expectEqual(a4, 4);
-    try testing.expectEqual(q.len, 1);
 
     const a5 = try q.popItem();
     try testing.expectEqual(a5, 5);
-    try testing.expectEqual(q.len, 0);
 }
