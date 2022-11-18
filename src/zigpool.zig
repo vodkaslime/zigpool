@@ -31,7 +31,7 @@ pub const ConnPool = struct {
     conns_map: AutoHashMap(*Stream, ConnStatus),
 
     pub fn init(allocator: Allocator, config: Config) !Self {
-        var queue = try mpmc.Queue(*Stream).init(allocator, config.capacity);
+        var queue = try mpmc.Queue(*Stream).init(allocator, config.capacity, 10);
         var conns_map = AutoHashMap(*Stream, ConnStatus).init(allocator);
         return Self {
             .allocator = allocator,
