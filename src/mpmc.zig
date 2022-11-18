@@ -29,6 +29,7 @@ pub fn Queue(comptime T: type) type {
         tail_index: usize,
         wait_time: u64,
 
+        // Initializes the mpmc queue with capacity and wait_time.
         pub fn init(allocator: Allocator, capacity: usize, wait_time: u64) !Self {
             if (capacity == 0) {
                 return QueueError.invalid_capacity;
@@ -53,6 +54,7 @@ pub fn Queue(comptime T: type) type {
             };
         }
 
+        // Deinit the mpmc queue. Free the contents in self.ring_buf.
         pub fn deinit(self: *Self) void {
             for (self.ring_buf) |item| {
                 self.allocator.destroy(item);
@@ -60,10 +62,14 @@ pub fn Queue(comptime T: type) type {
             self.allocator.free(self.ring_buf);
         }
 
+        // Wait self.wait_time for next run of action.
         fn wait(self: *Self) void {
             std.time.sleep(self.wait_time * std.time.ns_per_ms);
         }
 
+        // Pop item from the queue.
+        // If the queue is not empty, return the item.
+        // It the queue is emptry, return QueueError.queue_empty.
         pub fn popItem(self: *Self) !T {
             const capacity = self.ring_buf.len;
 
@@ -105,6 +111,9 @@ pub fn Queue(comptime T: type) type {
             }
         }
 
+        // Put item into the queue.
+        // If the queue is not full, put the item.
+        // It the queue is emptry, return QueueError.queue_full.
         pub fn putItem(self: *Self, item: T) !void {
             const capacity = self.ring_buf.len;
 
@@ -184,7 +193,7 @@ test "test_multiple_actions" {
     defer q.deinit();
 
     var index: usize = 0;
-    while (index < 100000): (index += 1) {
+    while (index < 1000): (index += 1) {
         try q.putItem(1);
 
         try q.putItem(2);
