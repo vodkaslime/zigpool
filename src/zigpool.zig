@@ -65,11 +65,12 @@ pub const ConnPool = struct {
         var stream_ptr = try self.allocator.create(Stream);
         errdefer self.allocator.destroy(stream_ptr);
         
-        const stream = try net.tcpConnectToHost(
+        var stream_frame = async net.tcpConnectToHost(
             self.allocator,
             self.config.host,
             self.config.port
         );
+        const stream = try await stream_frame;
         errdefer stream.close();
     
         stream_ptr.* = stream;
