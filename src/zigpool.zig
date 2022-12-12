@@ -115,7 +115,7 @@ pub const ConnPool = struct {
             stream.close();
             self.allocator.destroy(stream);
         } else {
-            ConnPoolError.stream_not_found;
+            return ConnPoolError.stream_not_found;
         }
     }
 };
